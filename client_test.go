@@ -21,6 +21,8 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
+	"fmt"
+	"log"
 	"net/http"
 	"testing"
 	"time"
@@ -28,6 +30,7 @@ import (
 	"github.com/cloudwego/hertz/pkg/app"
 	"github.com/cloudwego/hertz/pkg/app/server"
 	"github.com/cloudwego/hertz/pkg/common/hlog"
+	"github.com/cloudwego/hertz/pkg/common/json"
 	"github.com/cloudwego/hertz/pkg/common/test/assert"
 )
 
@@ -44,6 +47,22 @@ func newServer(empty bool, port string) {
 	h := server.Default(server.WithHostPorts("0.0.0.0:" + port))
 
 	h.GET("/sse", func(ctx context.Context, c *app.RequestContext) {
+		// client can tell server last event it received with Last-Event-ID header
+		lastEventID := GetLastEventID(c)
+		hlog.CtxInfof(ctx, "last event ID: %s", lastEventID)
+
+		// you must set status code and response headers before first render call
+		c.SetStatusCode(http.StatusOK)
+		s := NewStream(c)
+		publishMsgs(s, empty, 1000)
+	})
+	h.Run()
+}
+
+func newPostServer(empty bool, port string) {
+	h := server.Default(server.WithHostPorts("0.0.0.0:" + port))
+
+	h.POST("/sse", func(ctx context.Context, c *app.RequestContext) {
 		// client can tell server last event it received with Last-Event-ID header
 		lastEventID := GetLastEventID(c)
 		hlog.CtxInfof(ctx, "last event ID: %s", lastEventID)
@@ -124,7 +143,7 @@ func publishMsgs(s *Stream, empty bool, count int) {
 		if empty {
 			s.Publish(&Event{Data: []byte("\n")})
 		} else {
-			s.Publish(&Event{Data: []byte("ping")})
+			s.Publish(&Event{Data: []byte(fmt.Sprintf("ping%d", a))})
 		}
 	}
 }
@@ -156,18 +175,47 @@ func TestClientSubscribe(t *testing.T) {
 	events := make(chan *Event)
 	var cErr error
 	go func() {
-		cErr = c.Subscribe(func(msg *Event) {
+		cErr = c.Subscribe("test", func(msg *Event) {
 			if msg.Data != nil {
 				events <- msg
 				return
 			}
-		})
+		}, []byte(""))
 	}()
 
 	for i := 0; i < 5; i++ {
 		msg, err := wait(events, time.Second*1)
 		assert.Nil(t, err)
 		assert.DeepEqual(t, []byte(`ping`), msg)
+	}
+
+	assert.Nil(t, cErr)
+}
+func TestPostClientSubscribe(t *testing.T) {
+	c := NewPostClient("http://localhost:6789/hippo/turing/grace/v1/chat/completions/demo")
+	data := struct {
+		Model string `json:"model"`
+	}{
+		"hello world",
+	}
+	jsonByte, _ := json.Marshal(data)
+	events := make(chan *Event)
+	var cErr error
+	go func() {
+		cErr = c.Subscribe("", func(msg *Event) {
+			if msg.Data != nil {
+				events <- msg
+				return
+			}
+		}, jsonByte)
+	}()
+
+	for i := 0; i < 5; i++ {
+		msg, err := wait(events, time.Second*1)
+		log.Fatal(fmt.Sprintf("msg:%+v", string(msg)))
+		log.Fatal(cErr.Error())
+		assert.Nil(t, err)
+		assert.DeepEqual(t, []byte(`ping0`), msg)
 	}
 
 	assert.Nil(t, cErr)
@@ -182,12 +230,12 @@ func TestClientSubscribeMultiline(t *testing.T) {
 	var cErr error
 
 	go func() {
-		cErr = c.Subscribe(func(msg *Event) {
+		cErr = c.Subscribe("test", func(msg *Event) {
 			if msg.Data != nil {
 				events <- msg
 				return
 			}
-		})
+		}, []byte(""))
 	}()
 
 	for i := 0; i < 5; i++ {
@@ -195,7 +243,7 @@ func TestClientSubscribeMultiline(t *testing.T) {
 		assert.Nil(t, err)
 		assert.DeepEqual(t, []byte(mldata), msg)
 	}
-
+	println(cErr)
 	assert.Nil(t, cErr)
 }
 
@@ -205,11 +253,11 @@ func TestClientOnConnect(t *testing.T) {
 	c := NewClient("http://127.0.0.1:9000/sse")
 
 	called := make(chan struct{})
-	c.SetOnConnectCallback(func(ctx context.Context, client *Client) {
+	c.OnConnect(func(ctx context.Context, client *Client) {
 		called <- struct{}{}
 	})
 
-	go c.Subscribe(func(msg *Event) {})
+	go c.Subscribe("test", func(msg *Event) {}, []byte(""))
 
 	time.Sleep(time.Second)
 	assert.DeepEqual(t, struct{}{}, <-called)
@@ -220,7 +268,7 @@ func TestClientUnsubscribe401(t *testing.T) {
 	time.Sleep(time.Second)
 	c := NewClient("http://127.0.0.1:9009/sse")
 
-	err := c.Subscribe(func(ev *Event) {
+	err := c.SubscribeRaw(func(ev *Event) {
 		// this shouldn't run
 		assert.False(t, true)
 	})
@@ -241,9 +289,9 @@ func TestClientLargeData(t *testing.T) {
 	ec := make(chan *Event, 1)
 
 	go func() {
-		c.Subscribe(func(ev *Event) {
+		c.Subscribe("test", func(ev *Event) {
 			ec <- ev
-		})
+		}, []byte(""))
 	}()
 
 	d, err := wait(ec, time.Second)
